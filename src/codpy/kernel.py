@@ -21,6 +21,9 @@ from codpy.dictionary import cast
 from codpy.lalg import LAlg
 from codpy.permutation import Gromov_Monge, lsap, map_invertion
 from codpy.sampling import get_qmc_normals
+from codpy.data_conversion import sparse_coo_to_pytorch_coo
+
+from torch.utils.data import DataLoader, TensorDataset
 
 
 class Kernel:
@@ -487,6 +490,7 @@ class Kernel:
         else:
             self.fx = None
         self.set_theta(None)
+        return self
 
     def set_theta(self, theta: np.ndarray, **kwargs) -> None:
         """
@@ -1054,7 +1058,8 @@ class Kernel:
         ys=None,
         zs: np.ndarray = None,
         fxs: np.ndarray = None,
-        n_batch=1000,
+        py_batch=1000,
+        **kwargs
     ) -> np.ndarray:
         """
         Predict the output using the kernel for multiple input datasets.
@@ -1078,21 +1083,20 @@ class Kernel:
         Note:
             This function iterates over multiple datasets, applying the kernel prediction for each set of input data.
         """
-        if xs.shape[0] <= n_batch:
+        if xs.shape[0] <= py_batch:
             return core.KerOp.multi_projection(xs=xs,ys=ys,zs=zs,fxs=fxs,kernel_ptr=self.get_kernel(),order=self.order,reg=self.reg)
 
         def helper(n):
             return core.KerOp.multi_projection(
-                xs=xs[n * n_batch : (n + 1) * n_batch],
-                ys=ys[n * n_batch : (n + 1) * n_batch],
-                zs=zs[n * n_batch : (n + 1) * n_batch],
-                fxs=fxs[n * n_batch : (n + 1) * n_batch],
+                xs=xs[n * py_batch : (n + 1) * py_batch],
+                zs=zs[n * py_batch : (n + 1) * py_batch],
+                fxs=fxs[n * py_batch : (n + 1) * py_batch],
                 kernel_ptr=self.get_kernel(),
                 order=self.order,
                 reg=self.reg,
             )
 
-        out = np.concatenate(list(map(helper, list(range(xs.shape[0] // n_batch+bool(xs.shape[0] % n_batch))))))
+        out = np.concatenate(list(map(helper, list(range(xs.shape[0] // py_batch+bool(xs.shape[0] % py_batch))))))
         return out
 
     def __call__(
@@ -1319,13 +1323,18 @@ class KernelClassifier(Kernel):
 
 class SparseKernel(Kernel):
     def __init__(self,x=None,bandwidth=5,gram="raw",model="dense",faiss_fun=None,sto=False,**kwargs):
-        self.k= bandwidth
+        self.bandwidth= bandwidth
         self.gram = gram
         self.faiss_fun= faiss_fun
         self.model = model
         if sto == True: self.sto_flag = True
         super().__init__(x=x,**kwargs)
         pass
+
+    def default_kernel_functor(self) -> callable:
+        # return core.kernel_setter("gaussian", "cosine2", 0, 1e-9)
+        return core.kernel_setter("maternnorm", "cosine2", 0, 1e-9)
+
     
     def k_theta_model(self, z: np.ndarray=None,theta=None,second_member=None,gram="raw", **kwargs) -> np.ndarray:
         #compute f(z) = K(z,x) theta
@@ -1348,7 +1357,7 @@ class SparseKernel(Kernel):
             return LAlg.prod(result,second_member)
         return result
 
-    def __call__(self,z=None,theta=None,second_member=None,gram="raw",model=None,**kwargs):
+    def __call__(self,z=None,fx=None,theta=None,second_member=None,gram="raw",model=None,py_batch=5000,**kwargs):
         #compute f(z) = K(z,x) theta(z)
         # theta(z) known from the relations f(x(z))=K(x(z),x(z)) theta(z)
         # x(z) closest points to z, computed from k-nn
@@ -1356,21 +1365,70 @@ class SparseKernel(Kernel):
             model = self.model
         if model =="K_theta":
             return self.k_theta_model(z=z,theta=theta,second_member=second_member,gram=gram,**kwargs)
-        
+        if fx is None:
+            fx = self.get_fx()
         if z is None:
             z= self.get_x(**kwargs)
         index_x = self.get_index(**kwargs)
-        Nz = z.shape[0]
         D, Id, _ = Alg.faiss_knn_search(z=z,metric="cosine",index=index_x,**kwargs)
-        x_=self.get_x()
-        fx_=self.get_fx()
-        xs = x_[Id]
-        return super().multi_prediction(xs,xs,z.reshape([Nz,1,z.shape[1]]),fx_[Id]).squeeze()
+        if py_batch is None or z.shape[0] <= py_batch :
+            return core.KerOp.multi_projection(
+                xs=self.get_x()[Id],
+                fxs=fx[Id] if fx is not None else None, 
+                zs = z.reshape([z.shape[0],1,z.shape[1]]),
+                kernel_ptr=self.get_kernel(),
+                order=self.order,
+                reg=self.reg,
+            ).squeeze()
+
+        def helper(n):
+            return core.KerOp.multi_projection(
+                xs=self.get_x()[Id[n * py_batch : (n + 1) * py_batch]],
+                zs=z.reshape([z.shape[0],1,z.shape[1]]),
+                fxs=self.fx[Id[n * py_batch : (n + 1) * py_batch]],
+                kernel_ptr=self.get_kernel(),
+                order=self.order,
+                reg=self.reg,
+            ).squeeze()
+
+        out = np.concatenate(list(map(helper, list(range(Id.shape[0] // py_batch+bool(Id.shape[0] % py_batch))))))
+        return out.squeeze()
+
     def get_knm_coo(self, **kwargs):
         if not hasattr(self, "knm_coo_") or self.knm_coo_ is None:
             self.knm_coo_ = self.get_knm(**kwargs).tocoo()
-        return self.knm_coo_     
+        return self.knm_coo_   
+
     
+    # class cosine_similarity(nn.module):
+    #     def __init__(**kwargs):
+    #         super().__init__()
+    #     def forward(self,x=None,no_grad=False,**kwargs):
+        
+
+    # @torch.compile 
+    # Not using nn.module.Cosine see bug https://github.com/pytorch/pytorch/issues/104564
+    def cosine_similarity(x, y, dim=-1, eps=1e-9,no_grad=False,py_batch=None,**kwargs):
+        # get normalization value
+        if py_batch is None:py_batch=x.shape[0]
+        def helper(n):
+            t1 = x[n*py_batch:(n+1)*py_batch]
+            t2 = y[n*py_batch:(n+1)*py_batch]
+            if no_grad:
+                with torch.no_grad():
+                    return SparseKernel.cosine_similarity(x, y, dim=-1, eps=1e-8,no_grad=False)
+            t1_div = torch.linalg.vector_norm(t1, dim=dim, keepdims=True)+eps
+            t2_div = torch.linalg.vector_norm(t2, dim=dim, keepdims=True)+eps
+
+            # t1_norm = t1 / torch.clamp(t1_div, math.sqrt(eps))
+            # t2_norm = t2 / torch.clamp(t2_div, math.sqrt(eps))
+            t1_norm = t1 / t1_div
+            t2_norm = t2 / t2_div
+
+            return (t1_norm * t2_norm).sum(dim=dim)
+        out = torch.cat(list(map(helper, list(range(x.shape[0] // py_batch+bool(x.shape[0] % py_batch))))))
+        return out
+        
     def get_pytorch_model(self,theta,**kwargs):
         """
         Build a 1-layer torch model: logits = Kxx @ theta, optimize theta with AdamW via fit(...).
@@ -1381,22 +1439,46 @@ class SparseKernel(Kernel):
                 from codpy.data_conversion import sparse_coo_to_pytorch_coo
                 super().__init__()
                 self.sparse_kernel = sparse_kernel
-                Kxx = self.sparse_kernel.get_knm_coo(**kwargs).astype(np.float32)
-                self.register_buffer("Kxx",sparse_coo_to_pytorch_coo(Kxx))  # (N,N)
-                Y_t = torch.from_numpy(sparse_kernel.get_fx().astype(np.float32))
-                self.register_buffer("Y", Y_t)  # (N,C)
-                init_theta = torch.from_numpy(theta.reshape(self.Y.shape).astype(np.float32))
+                # Kxx = self.sparse_kernel.get_knm_coo(**kwargs).astype(np.float32)
+                self.register_buffer("x",torch.Tensor(self.sparse_kernel.get_x().astype(np.float32)).requires_grad_())  # (N,N)
+                # self.register_module("cosine", torch.nn.CosineSimilarity(dim=1, eps=1e-8))
+                self.cosine = SparseKernel.cosine_similarity
+                y = torch.Tensor(sparse_kernel.get_fx().astype(np.float32))
+                self.register_buffer("y", y)  # (N,C)
+                init_theta = torch.Tensor(theta.reshape(self.y.shape).astype(np.float32))
                 self.theta = torch.nn.Parameter(init_theta,requires_grad=True)  # (N,C)
+            def format(self,x):
+                if isinstance(x,torch.Tensor):
+                    return x.detach().clone().numpy().astype(np.float64).reshape([x.shape[0],-1])
 
-            def forward(self):
-                return torch.sparse.mm(self.Kxx, self.theta)
+            def forward(self,x=None,no_grad=False,**kwargs):
+                if x is None: 
+                    Kzx = sparse_coo_to_pytorch_coo(self.sparse_kernel.get_knm(**kwargs).astype(np.float32).tocoo())
+                else : 
+                    z = self.format(x)
+                    # D, Id, index = Alg.faiss_knn_search(z=x_, metric="cosine", index=self.sparse_kernel.get_index(), **kwargs)
+                    Kzx = self.sparse_kernel.knm(z=z,**kwargs).astype(np.float32).tocoo()
+                    row = torch.from_numpy(Kzx.row.astype(np.int64))
+                    col = torch.from_numpy(Kzx.col.astype(np.int64))
+                    coo_indices = torch.from_numpy(np.stack([row, col], 0))
+                    if no_grad:
+                        # with torch.no_grad():
+                        values = self.cosine(x.clone().detach()[row],self.x.clone().detach()[col],**kwargs)
+                    else:
+                        values = self.cosine(x[row],self.x[col],**kwargs)
+                    Kzx = torch.sparse_coo_tensor(coo_indices, values, torch.Size(Kzx.shape))
+
+                if no_grad:
+                    with torch.no_grad():out= torch.sparse.mm(Kzx, self.theta)
+                else:out= torch.sparse.mm(Kzx, self.theta)
+                return out
 
         return SparseKernel_pytorch(self,theta)
            
     def grad_pytorch(self,theta,device="cpu"):
         model = self.get_pytorch_model(theta)
         model.train()
-        loss = F.mse_loss(model(), model.Y, reduction="sum")            
+        loss = F.mse_loss(model(theta=theta), model.y, reduction="sum")            
         loss.backward()
         grad = model.theta.grad.numpy().astype(theta.dtype)        
         return grad.flatten()
@@ -1409,9 +1491,9 @@ class SparseKernel(Kernel):
         out = self.error_field(theta=theta,**kwargs)
         return (out*out).sum()*.5
 
-    def grad(self,z=None,k=None,theta=None,second_member=None,**kwargs):
-        if k is None: k=self.k
-        knm = self.grad_knm(z, self.get_y(),k=k,**kwargs)
+    def grad(self,z=None,bandwidth=None,theta=None,second_member=None,**kwargs):
+        if bandwidth is None: bandwidth=self.bandwidth
+        knm = self.grad_knm(z, self.get_y(),bandwidth=bandwidth,**kwargs)
         if theta is not None:
             result  = sparse_dot_mkl.dot_product_mkl(knm,theta)
         else:
@@ -1419,7 +1501,12 @@ class SparseKernel(Kernel):
         if second_member is not None:
             result  = LAlg.prod(result,second_member)
         return result.reshape(z.shape[0],z.shape[1],-1) 
-    
+
+    def set_x(self, x: np.ndarray, **kwargs) -> None:
+        super().set_x(x,**kwargs)
+        self.faiss_index = None
+
+
     def grad_theta(self,theta,dtype=np.float64,second_member=None,**kwargs):
         knm = self.get_knm(**kwargs)
         if second_member is None:
@@ -1432,27 +1519,38 @@ class SparseKernel(Kernel):
     def callback(self,theta,verbose = False):
         if verbose:
             print("callback error: ",self.error(theta))
-    def get_theta(self,method="gd", model=None,maxiter=20, maxls=5,verbose=False,**kwargs) -> np.ndarray:
+    def get_theta(self,method="gd", model=None,verbose=False,**kwargs) -> np.ndarray:
         if model is None : 
             model = self.model
+        if model == "dense" : 
+            return None
 
         if not hasattr(self, "theta") or self.theta is None:
             knm,fx=self.get_knm(**kwargs),self.get_fx()
             theta= algs.Alg.conjugate_gradient_descent(knm,fx.astype(knm.dtype),steps=1,dot_product=sparse_dot_mkl.dot_product_mkl).astype(np.float64)
             timer = time.perf_counter()
             if method == "adams":
+                x,fx = self.get_x(),self.get_fx()
+                x_torch,fx_torch = torch.tensor(x, dtype=torch.float32).view(-1, 1, 28, 28), torch.tensor(fx, dtype=torch.float32)
                 if verbose: 
                     print("error adams beg: ",self.error(theta,**kwargs))
-                sk_torch_model = self.get_pytorch_model(theta, **kwargs)
+                model = self.get_pytorch_model(theta=theta, **{**kwargs,**{"x":x,"fx":fx}})
+                adams_batch = kwargs.get("adams_batch", x.shape[0])
+                trainloader = DataLoader(TensorDataset(x_torch,fx_torch), batch_size=min(adams_batch, x.shape[0]), shuffle=True)
                 self.theta = algs.Alg.adams_pytorch(
-                    x0=theta,
-                    model=sk_torch_model,
+                    trainloader = trainloader,
                     epochs=maxiter,
-                    **kwargs,
+                    **{**kwargs,**{
+                        "x0":theta,
+                        "model":model,
+                        "x":x,
+                        "fx":fx,
+                        "verbose":verbose
+                    }}
                 )
                 if verbose: 
                     print("error adams end: ",self.error(self.theta,**kwargs), "time",time.perf_counter()-timer)
-                self.theta = Alg.get_torch_parameters(sk_torch_model).reshape(self.get_fx().shape)
+                self.theta = model.get_parameters().reshape(self.get_fx().shape)
 			# <--- PYTORCH_BFGS (SciPy L-BFGS-B + PyTorch grad) -------------------->
             elif method == "pytorch_bfgs":
                 if verbose: 
@@ -1465,22 +1563,21 @@ class SparseKernel(Kernel):
                         # xk is theta as a flat vector
                         loss_val = self.error(xk, **kwargs)
                         trace.record(theta=xk, t=t_now, k=len(trace.iters), loss = loss_val)
-                # out,fmin,infos = scipy.optimize.fmin_l_bfgs_b(func=self.error,x0=theta,fprime=self.grad_pytorch,maxiter=maxiter,maxls=maxls,callback=self.callback)
+                callback_xk(theta,**kwargs)
                 out,fmin,infos = scipy.optimize.fmin_l_bfgs_b(func=self.error,x0=theta,fprime=self.grad_pytorch,maxiter=maxiter,maxls=maxls,callback= callback_xk)
                 if verbose: print("error end: ",fmin, "funcalls",infos["funcalls"],"nit",infos["nit"],"warnflag",infos["warnflag"], "time",time.perf_counter()-timer)
                 self.theta = out.astype(self.x.dtype).reshape(self.get_fx().shape)
             elif method == "bfgs":
                 # <--- BFGS (SciPy L-BFGS-B + analytic grad) ------------------------------->
                 trace = kwargs.get("trace", None)
-                t0 = time.perf_counter()
-                def callback_xk(xk, **kwargs):
+                def callback(*args,**kwargs):
                     if trace is not None:
-                        t_now = time.perf_counter() - t0
-                        loss_val = self.error(xk, **kwargs)
-                        trace.record(theta=xk, t=t_now, k=len(trace.iters), loss = loss_val)
-                if verbose: print("error beg: ",self.error(theta,**kwargs))
-                # out,fmin,infos = scipy.optimize.fmin_l_bfgs_b(func=self.error,x0=theta,fprime=self.grad_theta,maxiter=maxiter,maxls=maxls,callback=self.callback)
-                out,fmin,infos = scipy.optimize.fmin_l_bfgs_b(func=self.error,x0=theta,fprime=self.grad_theta,maxiter=maxiter,maxls=maxls,callback=callback_xk)
+                        pass #record something
+                    pass #for trace tracking
+                t0 = time.perf_counter()
+                if verbose: 
+                    print("error beg: ",self.error(theta,**kwargs))
+                out,fmin,infos = scipy.optimize.fmin_l_bfgs_b(func=self.error,x0=theta,fprime=self.grad_theta,maxiter=maxiter,maxls=maxls,callback=callback)
                 if verbose: print("error end: ",fmin, "funcalls",infos["funcalls"],"nit",infos["nit"],"warnflag",infos["warnflag"], "time",time.perf_counter()-timer)
                 self.theta = out.astype(self.x.dtype).reshape(self.get_fx().shape)
             elif method ==  "gd":
@@ -1495,7 +1592,7 @@ class SparseKernel(Kernel):
         return self.theta
     
     def get_index(self,**kwargs):
-        if not hasattr(self,"faiss_index"):
+        if not hasattr(self,"faiss_index") or self.faiss_index is None:
             self.faiss_index = algs.Alg.faiss_knn_index(x=self.get_x(), **kwargs)
         return self.faiss_index
 
@@ -1506,6 +1603,8 @@ class SparseKernel(Kernel):
         index_x = self.get_index(**kwargs)
         if z is None: 
             z=self.get_x()
+        else:
+            z = get_matrix(z)
         Sx,_ = algs.Alg.faiss_knn(z=z, metric="cosine",index=index_x, **kwargs)
         if fy is not None:
             return sparse_dot_mkl.dot_product_mkl(Sx,fy)
@@ -1519,8 +1618,8 @@ class SparseKernel(Kernel):
        
         return Sx
     
-    def grad_knm(self, x=None, z=None, k=None,**kwargs) :
-        if k is None: k = self.k
+    def grad_knm(self, x=None, z=None, bandwidth=None,**kwargs) :
+        if bandwidth is None: bandwidth = self.bandwidth
         if x is None: x = self.get_x()
         if z is None: z = self.get_y()
         out = algs.Alg.grad_faiss_knn(x, z,k=k,fun=None, metric="cosine",**kwargs)

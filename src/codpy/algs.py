@@ -15,9 +15,14 @@ import torch
 import torch.nn.functional as F
 import torch.nn.utils as nn_utils
 from scipy import optimize
+from scipy.optimize import line_search
 from scipy.sparse import csr_matrix
 from scipy.special import softmax
 from torch import nn
+
+import pickle
+import datetime
+
 
 import codpy.core
 from codpy.core import KerInterface, KerOp, _requires_rescale
@@ -32,12 +37,23 @@ class TrainingTrace:
     thetas: list = field(default_factory=list)  # les copies des parametres
     iters: list = field(default_factory=list)  # idx des iterations
     losses: list = field(default_factory=list)  # loss
-
+    nb : int = 20
     def record(self, theta, t, k, loss):
         self.thetas.append(theta)
         self.times.append(float(t))
         self.iters.append(int(k))
         self.losses.append(loss)
+    def save(self,file_name=None):
+        if file_name is None:
+            file_name = "trace"+str(datetime.datetime.now().timestamp())
+        with open(file_name, "wb") as handle:
+            pickle.dump((self.thetas, self.times, self.iters, self.losses), handle, protocol=pickle.HIGHEST_PROTOCOL)
+
+    def load(self,file_name):
+        debug = pickle.load(file_name)
+        (
+            self.thetas, self.times, self.iters, self.losses
+        ) = debug
 
 
 class Alg:
@@ -220,14 +236,13 @@ class Alg:
         trace=None,
         **kwargs,
     ):
+        if max_count <= 0 : return x0
         t0 = time.perf_counter()
         grad = grad_fun(x0, **kwargs)
         grad_start = (grad * grad).sum()
         if grad_start <= threshold:
             if verbose:
                 print("gradient_descent : No grad")
-                if trace is not None:
-                    trace.record(theta=np.asarray(x0).copy(), t=time.perf_counter() - t0,k=0)
             return x0
         x = x0.copy()
         count = 0
@@ -235,20 +250,24 @@ class Alg:
         def f(t):
             next = x.copy()
             next -= grad * t
-            out = fun(next)
+            out = fun(next,**kwargs)
             return out
 
         fstart, fval, xmin = None, None, 0.0
+        if trace is not None :
+            trace.last_time_record = time.perf_counter()
         while count < max_count:
 #### starting gradient descent
+            t_now = time.perf_counter()
             left, middle, right = 0.0, eps, 2 * eps
             fleft, fmiddle, fright = f(left), f(middle), f(right)
 
-####for trace and analysis            
+####for trace and analysis
             if trace is not None:
-                t_now = time.perf_counter() - t0
-                k = count  # epoch index
-                trace.record(theta=x.copy(), t=t_now, k=k, loss = fleft)
+                if count==0 or t_now - trace.last_time_record > trace.toc :#          
+                    t_now = time.perf_counter() - t0
+                    trace.record(theta=x.copy(), t=t_now, k=count, loss = fleft)
+                    trace.last_time_record = t_now
 
 
             fprime = (fmiddle - fleft) / (middle - left)
@@ -263,9 +282,7 @@ class Alg:
                     break
                 middle, right = eps, 2 * eps
                 fmiddle, fright = fright, f(right)
-            if fstart is not None and fleft > fval:
                 pass
-                # break
             if fstart is None:
                 fstart, fval = fleft, fleft
             fsec = (fleft + fright - 2 * fmiddle) / (eps * eps)
@@ -278,6 +295,10 @@ class Alg:
                     break
                     assert False
             if fprime > -1e-9:
+                print("abnormal termination in gradient descent : loss derivative should be negative :",fprime)
+                break
+            if eps >= 1.0:
+                print("abnormal termination in gradient descent : no minimum in line search :",eps)
                 break
             if fsec * np.sign(fmiddle) > 0 and consistency < 1.0:
                 middle = np.abs(fleft / fprime)
@@ -301,9 +322,13 @@ class Alg:
                     break
                 xmin = right
             else:
-                xmin, fval, iter, funcalls = optimize.brent(
+                xmin, fval_, iter, funcalls = optimize.brent(
                     f, brack=(left, middle, right), maxiter=5, full_output=True
                 )
+            if fval_> fval:
+                print("abnormal termination in gradient descent : loss=",fval_,"previous loss=",fval)
+                break
+            fval = fval_
             x -= grad * xmin
             if constraints is not None:
                 x = constraints(x)
@@ -311,14 +336,19 @@ class Alg:
             grad = grad_fun(x, **kwargs)
             if (grad * grad).sum() / grad_start <= threshold:
                 break
-        if verbose:
+            if verbose:
+                print(
+                    f"gradient_descent : Iteration {count} | fun(t0): {fstart:.6e} | eps : {eps:.6e} fun({count}): {fval:.6e} | step: {xmin:.2e} | time: {time.perf_counter()-t0:.2e}  | der: {fprime:.2e}, consistency: {consistency:.2e}"
+                )
+        if verbose and max_count >0:
             print(
-                f"gradient_descent : Iteration {count} | fun(t0): {fstart:.6e} | eps : {eps:.6e} fun(terminal): {fval:.6e} | step: {xmin:.2e} | time: {time.perf_counter()-t0:.2e}  | der: {fprime:.2e}, consistency: {consistency:.2e}"
+                f"gradient_descent : Iteration {count} | fun(t0): {fstart:.6e} | eps : {eps:.6e} fun({count}): {fval:.6e} | step: {xmin:.2e} | time: {time.perf_counter()-t0:.2e}  | der: {fprime:.2e}, consistency: {consistency:.2e}"
             )
         return x
 
     def bfgs_batch(
-        x_fx,
+        x,
+        fx,
         theta0,
         fun,
         grad_fun,
@@ -329,38 +359,45 @@ class Alg:
         trace=None,
         **kwargs,
     ):
-        t0 = time.perf_counter()
-        x, fx = x_fx
+        t0,uncount = time.perf_counter(),0.
+        fmin = None
+        indices = np.array(range(x.shape[0]))
+        np.random.shuffle(indices)
         if verbose:
-            print("error bfgs batch beg: ", fun(x_fx)(theta0))
+            fmin = fun(x,fx)
+            print("error bfgs batch beg: ", fmin)
         theta = theta0
-        if trace is not None:
-            t_now = time.perf_counter() - t0
-            k = ep  # epoch index
-            trace.record(theta=theta, t=t_now, k=k, loss = fmin)
-        theta, fmin, infos = scipy.optimize.fmin_l_bfgs_b(
-            func=fun(x_fx),
-            x0=theta,
-            fprime=grad_fun(x_fx),
-            maxiter=maxiter,
-            maxls=maxls,
-        )
-        bfgs_batch >= x.shape[0]        
-        for n in range(maxiter):
-            if trace is not None:
-                t_now = time.perf_counter() - t0
-                k = count  # epoch index
-                trace.record(theta=x.copy(), t=t_now, k=k, loss = fleft)
 
-            indices = np.random.choice(range(x.shape[0]), bfgs_batch)
-            x_fx = x[indices], fx[indices]
+
+        if bfgs_batch >= x.shape[0]:
             theta, fmin, infos = scipy.optimize.fmin_l_bfgs_b(
-                func=fun(x_fx),
+                func=fun(x,fx),
                 x0=theta,
-                fprime=grad_fun(x_fx),
-                maxiter=1,
+                fprime=grad_fun(x,fx),
+                maxiter=maxiter,
                 maxls=maxls,
             )
+        else:
+            for n in range(maxiter):
+                t_now = time.perf_counter()
+                if trace is not None:
+                    if n==0 or t_now - trace.last_time_record > trace.toc :
+                        loss = fun(theta=theta,indices = indices,**kwargs)
+                        trace.record(theta=theta, t=t_now-t0-uncount, k=n, loss = loss)
+                        print("#### bfgs batch trace iter : ",n,"loss : ",loss," elapsed: ",t_now-t0)
+                        uncount += time.perf_counter() - t_now
+                        trace.last_time_record = t_now
+                min_ind = (n*bfgs_batch)%indices.shape[0]
+                inds = indices[min_ind:min(min_ind+bfgs_batch,indices.shape[0])]
+                if len(inds) > 1:
+                    theta, fmin, infos = scipy.optimize.fmin_l_bfgs_b(
+                        func=fun.set_indices(inds),
+                        x0=theta,
+                        fprime=grad_fun.set_indices(inds),
+                        maxiter=1,
+                        maxls=maxls
+                    )
+                print("bfgs batch iter : ",n,"loss : ",fmin," elapsed: ",t_now-t0)
 
         if verbose:
             print(
@@ -410,7 +447,7 @@ class Alg:
         index.add(X)
         return index
 
-    def faiss_knn_search_max(x, index, z=None, k=20, faiss_fun=None, **kwargs):
+    def faiss_knn_search_max(x, index, z=None, bandwidth=20, faiss_fun=None, **kwargs):
         """
         Faiss k-nearest neighbors search using a pre-built index.
         Args:
@@ -420,11 +457,11 @@ class Alg:
             k: Number of nearest neighbors to find.
         """
         Nx, d = x.shape
-        k = min(k, Nx - 1)
+        bandwidth = min(bandwidth, Nx - 1)
         Z = x if z is None else z
         Nz = Z.shape[0]
 
-        D, Id = index.search(Z, min(k, Nx))  # shapes (Nz, k+1)
+        D, Id = index.search(Z, min(bandwidth, Nx))  # shapes (Nz, k+1)
         row = np.repeat(np.arange(Nz, dtype=np.int64), k)  # (N*k,)
         col = Id.reshape(-1)
         if faiss_fun is None:
@@ -435,7 +472,7 @@ class Alg:
         return out.T  # Nx, Nz
 
     def faiss_knn_index(
-        x: np.ndarray, k: int = 20, metric="cosine", faiss_fun=None, **kwargs
+        x: np.ndarray, metric="cosine", faiss_fun=None, **kwargs
     ) -> Tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray]:
         Nx, d = x.shape
         if metric == "cosine":
@@ -453,43 +490,42 @@ class Alg:
         return index  # Nx, Nz
 
     def faiss_knn_search(
-        z: np.ndarray, k: int = 20, metric="cosine", index=None, **kwargs
+        z: np.ndarray, bandwidth: int = 20, metric="cosine", index=None, faiss_fun=None,**kwargs
     ) -> Tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray]:
         if metric == "cosine":
             z = z / (np.linalg.norm(z, axis=1)[:, None] + 1e-9)
         elif metric == "METRIC_L1":
             z = z / (np.fabs(Z).sum(1)[:, None] + 1e-9)
         if index is None:
-            index = Alg.faiss_knn_index(x=z, k=k, metric=metric, **kwargs)
+            index = Alg.faiss_knn_index(x=z, k=bandwidth, metric=metric, **kwargs)
         Nx = index.ntotal
-        k = min(k, Nx - 1)
+        bandwidth = min(bandwidth, Nx - 1)
 
-        D, Id = index.search(z, k)
+        D, Id = index.search(z, bandwidth)
+        if faiss_fun is not None:
+            D = faiss_fun(D)
         return D, Id, index  # shapes (Nz, k+1)
 
     def faiss_knn(
         z: np.ndarray,
-        k: int = 20,
+        bandwidth: int = 20,
         metric="cosine",
         faiss_fun=None,
         index=None,
         **kwargs,
     ) -> Tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray]:
         if index is None:
-            index = Alg.faiss_knn_index(x=z, k=k, metric=metric, **kwargs)
+            index = Alg.faiss_knn_index(x=z, bandwidth=bandwidth, metric=metric, **kwargs)
         Nx = index.ntotal
         Nz = z.shape[0]
-        k = min(k, Nx - 1)
+        bandwidth = min(bandwidth, Nx - 1)
 
         D, Id, index = Alg.faiss_knn_search(
-            z=z, k=k, metric=metric, index=index, **kwargs
+            z=z, bandwidth=bandwidth, metric=metric, index=index, **kwargs
         )
-        col = np.repeat(np.arange(Nz, dtype=np.int64), k)  # (N*k,)
+        col = np.repeat(np.arange(Nz, dtype=np.int64), bandwidth)  # (N*k,)
         row = Id.reshape(-1)
-        if faiss_fun is None:
-            values = D.ravel()
-        else:
-            values = faiss_fun(D.ravel())
+        values = D.ravel()
         out = sp.coo_matrix((values, (col, row)), shape=(Nz, Nx), dtype=z.dtype).tocsr()
         return out, index  # Nx, Nz
 
@@ -500,6 +536,7 @@ class Alg:
         faiss_threshold=1e-1,
         faiss_nb_select=None,
         faiss_fun=None,
+        Filter=False,
         **kwargs,
     ):
         mask = np.where((x * x).sum(1) > 1e-9)[0]
@@ -515,41 +552,41 @@ class Alg:
             x = x / (np.fabs(x).sum(1)[:, None] + 1e-9)
             index = faiss.index_factory(d, f"PQ{d//28}", faiss.METRIC_L1)
             index.train(x)
+        if Filter:
+            def helper(n):
+                z = x[n : min(n + faiss_batch_size, Nx)]
+                if metric == "cosine":
+                    if z.shape[0] == 0:
+                        return None
+                    if index.ntotal == 0:
+                        index.add(z)
+                        return z
+                    D, Id = index.search(z, 1)
+                    if faiss_fun is not None:
+                        D = faiss_fun(D)
+                    mask = np.where(D[:, 0] > faiss_threshold)[0]
+                    if mask.size > 0:
+                        index.add(z[mask])
+                        return z[mask]
 
-        def helper(n):
-            z = x[n : min(n + faiss_batch_size, Nx)]
-            if metric == "cosine":
-                mask = np.where((z * z).sum(1) > 1e-9)[0]
-                z = z[mask]
-                if z.shape[0] == 0:
-                    return None
-                if index.ntotal == 0:
-                    index.add(z)
-                    return z
-                D, Id = index.search(z, 1)
-                if faiss_fun is not None:
-                    D = faiss_fun(D)
-                mask = np.where(D[:, 0] > faiss_threshold)[0]
-                if mask.size > 0:
-                    index.add(z[mask])
-                    return z[mask]
-
-        out = map(helper, list(range(0, Nx, faiss_batch_size)))
-        out = np.concatenate([o for o in out if o is not None])
-        if faiss_nb_select is not None and out.shape[0] > faiss_nb_select:
-            D, Id = index.search(out, 2)
+            x = map(helper, list(range(0, Nx, faiss_batch_size)))
+            x = np.concatenate([o for o in out if o is not None])
+        removed_indices = None
+        if faiss_nb_select is not None and x.shape[0] > faiss_nb_select:
+            D, Id = index.search(x, 2)
             if faiss_fun is not None:
                 D = faiss_fun(D)
             indices = np.argsort(-D[:, 1])
-            out = out[indices[:faiss_nb_select]]
+            removed_indices = indices[:faiss_nb_select]
+            x = x[indices[:faiss_nb_select]]
             index.remove_ids(indices[faiss_nb_select:])
             print(f"faiss_knn_select: time {time.perf_counter()-timer} seconds.")
-        return out, index  # Nx, Nz
+        return x, index, removed_indices  # Nx, Nz
 
     def grad_faiss_knn(
         x: np.ndarray,
         z: np.ndarray = None,
-        k: int = 20,
+        bandwidth: int = 20,
         knm=None,
         metric="cosine",
         grad_faiss_fun=None,
@@ -558,7 +595,7 @@ class Alg:
     ):
         D = x.shape[1]
         if knm is None:
-            knm = Alg.faiss_knn(x, z, k=k, **kwargs)
+            knm = Alg.faiss_knn(x, z, bandwidth=bandwidth, **kwargs)
         if metric == "cosine":
             x = x / (np.linalg.norm(x, axis=1)[:, None] + 1e-9)
             z = z / (np.linalg.norm(z, axis=1)[:, None] + 1e-9)
@@ -577,40 +614,54 @@ class Alg:
     def multiply_sequence(sequence):
         from functools import reduce
         return reduce(lambda x, y: x * y, sequence)
-    def get_torch_grad_parameters(torch_model):
-        return np.concatenate([p.grad.detach().numpy().flatten() for p in torch_model.parameters()])
-    def get_torch_parameters(torch_model): #retrieve the pytorch parameters with numpy, flattened and concatenated
+    def get_torch_grad_parameters(torch_model,dtype=None,requires_grad = True,**kwargs):
+        out = []
+        for p in torch_model.parameters():
+            if p.grad is not None:
+                out.append(p.grad.detach().numpy().flatten())
+        return np.concatenate(out)
+    def get_torch_parameters(torch_model,dtype=None,requires_grad = True,**kwargs): #retrieve the pytorch parameters with numpy, flattened and concatenated
         out = []
         with torch.no_grad():
             for param in torch_model.parameters():
-                out.append(param.detach().cpu().numpy().copy())
+                if param.,requires_grad = requires_grad:
+                    out.append(param.detach().cpu().numpy().copy())
+            if dtype is not None:
+                return torch.cat([torch.tensor(p.flatten()).to(torch.float32) for p in out])
             return np.concatenate([p.flatten() for p in out])
-    def set_torch_parameters(torch_model,theta = None): #given a numpy flatten vector, set the model pytorch parameters with it
+    def set_torch_parameters(torch_model,theta = None,requires_grad = True): #given a numpy flatten vector, set the model pytorch parameters with it
         if theta is not None: 
+            if isinstance(theta,torch.Tensor):
+                theta = theta.clone().detach().numpy()
             count = 0
-            for param in torch_model.parameters():
+            for param in torch_model.parameters() where ,requires_grad = True:
                 t_size = Alg.multiply_sequence(param.shape)
                 transformed_param = torch.tensor(theta[count:count+t_size].reshape(param.shape),requires_grad=True)
-                with torch.no_grad() : 
-                    transformed_param.copy_(param.data)       
+                param.data.copy_(transformed_param.data)
                 count += t_size
 
         return torch_model
     
     def adams_pytorch(
-        model: nn.Module,
-        epochs: int = 100,
-        x0=None,
+        torch_model: nn.Module,
+        trainloader,
+        x,
+        fx,
+        loss= None,
+        optimizer= None,
+        epochs: int = 5,
+        theta=None,
         constraints = None,
         trace = None,
         verbose = None,
-        learning_rate= 1e-3,
+        learning_rate= 1e-2,
         # Adam hyperparams
         betas = (0.9, 0.999),
         eps = 1e-8,
         weight_decay = 0.0,
         grad_clip_norm = None,
         device="cpu",
+        hook = None,
         **kwargs,
     ):
         """
@@ -621,51 +672,98 @@ class Alg:
         - Optional grad clipping and constraints hook.
         - Returns list of per-epoch loss values.
         """
-        theta = x0
+        x0 = theta
+        if learning_rate is None:
+            lr = 1e-3
+        else:
+            lr = learning_rate
         if theta is None:
-            theta = Alg.get_torch_parameters(model)
+            theta = Alg.get_torch_parameters(torch_model)
         else:
-            Alg.set_torch_parameters(model,x0)
-        t0 = time.perf_counter()
-        def loss_closure():
-            preds = model()  # forward __call__
-            loss = F.mse_loss(preds, model.Y, reduction="sum")*.5
-            return loss
-
-
-        model.train()
-
+            Alg.set_torch_parameters(torch_model,theta)
         # theta = [p for p in model.parameters() if p.requires_grad]
-        theta = model.theta
-        opt = torch.optim.AdamW(
-            [theta], lr=learning_rate, weight_decay=weight_decay, betas=betas, eps=eps
-        )
+        torch_model.train()
+        if optimizer is None:
+            optimizer = torch.optim.AdamW(
+                torch_model.parameters(), lr=lr, weight_decay=weight_decay, betas=betas, eps=eps
+            )
+        if loss is None:
+            # loss = nn.MSELoss()
+            loss = nn.CrossEntropyLoss()
+        
+        fx_torch = torch.Tensor(fx).reshape(fx.shape)
+        if verbose:
+            preds = torch.Tensor(torch_model(x,**kwargs,no_grad=True))
+            print("error adams batch beg: ", loss(preds,fx_torch))
+        count = 0
+        epoch=0
+        uncount = 0.
+        t0 = time.perf_counter()
+        if trace is not None:
+            trace.last_time_record = time.perf_counter()
+            tic = epochs*len(trainloader)/trace.nb
+        loss_value_1=0.
+        while(epoch < epochs ):
+            for x_batch, fx_batch in trainloader:
+                t_now = time.perf_counter() 
+                theta=Alg.get_torch_parameters(torch_model)
+                if trace is not None:
+                    if count % tic ==0 :
+                        with torch.no_grad():
+                            preds = torch_model(x,**kwargs,no_grad=True)
+                            trace.record(theta=theta, t=t_now-t0-uncount, k=count, loss = float(loss(preds,fx_torch).data.detach().numpy()))
+                            uncount += time.perf_counter() - t_now
+                            trace.last_time_record = t_now
 
-        for ep in range(epochs):
-            opt.zero_grad(set_to_none=True)
-            loss = loss_closure()  # must return a scalar tensor
-            # loss_val = float(loss)
-            loss.backward()
+                optimizer.zero_grad(set_to_none=True)
+                preds = torch_model(x_batch,**kwargs)
+                fx_ = torch.reshape(fx_batch,preds.shape)
+                loss_value = loss(preds, fx_)
+                loss_value.backward()
+                grad_theta = Alg.get_torch_grad_parameters(torch_model)
+                grad_norm = np.linalg.norm(grad_theta)+1e-8
+                optimizer.step()
 
-            if trace is not None:
-                t_now = time.perf_counter() - t0
-                trace.record(Alg.get_torch_parameters(model), t=t_now, k=ep, loss = float(loss.data))
+                # if learning_rate is None:
+                #     def f(t):
+                #         preds = torch_model(x_batch,theta_torch=theta-t*grad_theta,**kwargs)
+                #         out = np.float64(loss(preds, fx_).detach().clone().numpy())
+                #         return out
+                #     xmin, fval_, iter, funcalls = optimize.brent(
+                #         f, brack=(lr, 1./grad_norm), maxiter=5, full_output=True
+                #     )
+                #     Alg.set_torch_parameters(torch_model, theta-xmin*grad_theta)
+                #     preds = torch_model(x_batch,**kwargs)
+                #     loss_value = loss(preds, fx_)
+                #     loss_value.backward()
+                #     optimizer.param_groups[0]['lr'] = xmin
+                #     pass                    
+                # else:
+                #     optimizer.step()
 
-            if grad_clip_norm is not None and grad_clip_norm > 0:
-                nn_utils.clip_grad_norm_(model.parameters(), grad_clip_norm)
+                # if grad_norm < 1e-6:
+                #     break
+                # if count > 1 and learning_rate is None:
+                #     optimizer.param_groups[0]['lr'] = torch.abs(loss_value_1-loss_value)/(grad_norm+1e-6)
+                loss_value_1 = loss_value
 
-            opt.step()
+                if constraints is not None:
+                    constraints(torch_model)
 
-            if constraints is not None:
-                constraints(model)
-
+                
+                count += 1
+            if hook is not None:
+                trainloader = hook(model=torch_model,theta=theta,trainloader=trainloader)
+            epoch +=1
             if verbose is not None:
-                print(f"[{ep+1:04d}/{epochs}] loss={loss.data:.6f}")
+                print(f"[epoch={epoch:04d}] count={count:04d}, loss={float(loss_value.data.detach().numpy()):.6f}, grad norm={grad_norm:.6f}, lr={optimizer.param_groups[0]['lr']:.6f}")
+        if verbose:
+            preds = torch.Tensor(torch_model(x,**kwargs))
+            print("error adams batch end: ", loss(torch_model(x,**kwargs),fx_torch))
         if x0 is not None:
-            return Alg.get_torch_parameters(model).reshape(x0.shape)
+            return Alg.get_torch_parameters(torch_model).reshape(x0.shape)
         else:
-            return Alg.get_torch_parameters(model)
-
+            return Alg.get_torch_parameters(torch_model)
 
 if __name__ == "__main__":
     from include_all import *

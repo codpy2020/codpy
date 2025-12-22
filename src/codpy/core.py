@@ -78,8 +78,9 @@ class KerOp:
 
     @staticmethod
     def multi_projection(
-        xs, ys, zs, fxs, kernel_ptr=None, reg=1e-9, order=0, reg_matrix=[], **kwargs
+        xs, zs, fxs, ys=None, kernel_ptr=None, reg=1e-9, order=0, reg_matrix=[], **kwargs
     ):
+        if ys is None: ys=xs
         if kernel_ptr is not None:
             KerInterface.set_kernel_ptr(kernel_ptr, order, reg)
         return cd.op.multi_projection(xs, ys, zs, fxs, reg_matrix)
